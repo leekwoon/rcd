@@ -29,8 +29,8 @@ This is the official implementation for "*Refining Compositional Diffusion for R
     <td width="50%" align="center"><b>Task 5</b></td>
   </tr>
   <tr>
-    <td width="50%"><video src="media/motiv_task3.mp4" autoplay loop muted playsinline width="100%"></video></td>
-    <td width="50%"><video src="media/motiv_task5.mp4" autoplay loop muted playsinline width="100%"></video></td>
+    <td width="50%"><img src="media/motiv_task3.gif" width="100%"></td>
+    <td width="50%"><img src="media/motiv_task5.gif" width="100%"></td>
   </tr>
 </table>
 
@@ -132,8 +132,8 @@ A self-contained reproduction of the toy bimodal composition example (Figure 1 o
     <td width="50%" align="center"><b>RCD</b></td>
   </tr>
   <tr>
-    <td width="50%"><video src="media/toy_base_L12.mp4" autoplay loop muted playsinline width="100%"></video></td>
-    <td width="50%"><video src="media/toy_rcd_L12_lam5.mp4" autoplay loop muted playsinline width="100%"></video></td>
+    <td width="50%"><img src="media/toy_base_L12.gif" width="100%"></td>
+    <td width="50%"><img src="media/toy_rcd_L12_lam5.gif" width="100%"></td>
   </tr>
 </table>
 
