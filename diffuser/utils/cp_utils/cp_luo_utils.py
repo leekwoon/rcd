@@ -38,8 +38,6 @@ def compute_ovlp_dist(trajs_list_un, len_ovlp_cd):
         _, end_traj_1 = extract_ovlp_from_full(traj_1, len_ovlp_cd)
         st_traj_2, _ = extract_ovlp_from_full(traj_2, len_ovlp_cd)
         
-        print(f'{end_traj_1.shape=}')
-
         # tmp_dist = np.linalg.norm( end_traj_1 - st_traj_2 ).item()
         mse_dist = (end_traj_1 - st_traj_2) ** 2
         ## (B,)
@@ -49,9 +47,6 @@ def compute_ovlp_dist(trajs_list_un, len_ovlp_cd):
 
     ## (B, n_comp-1)
     dist_all = np.stack(dist_all, axis=1)
-    print(f'{dist_all.shape=}')
-    # print(dist_all)
-
     ## (B,) the avg dist of one sample
     dist_per_sam = dist_all.sum(axis=1)
     ## print(dist_per_sam)

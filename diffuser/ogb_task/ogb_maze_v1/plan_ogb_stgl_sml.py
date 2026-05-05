@@ -23,6 +23,59 @@ class Parser(utils.Parser):
     ## should not put any existing variable in config file here
     pl_seeds: str = '-1' # no seed
     plan_n_ep: int = -100 ## all if -100, auto parse to int
+    ep_st_idx: int = 0
+    is_save_pkl: bool = False
+    save_logbase: str = None
+    pq_logbase: str = "logs_pq_subset"
+    eval_method: str = "compdiffuser"
+    ev_meta_method: str = "baseline"
+    ev_density_p_ratio: float = 0.35
+    ev_density_n_mc: int = 2
+    ev_search_beam_width: int = 6
+    ev_search_chunk_pool: int = 4
+    ev_search_density_weight: float = 0.35
+    ev_search_overlap_weight: float = 1.0
+    ev_search_vel_weight: float = 0.35
+    ev_search_acc_weight: float = 0.15
+    ev_search_rough_weight: float = 0.05
+    ev_search_commit_weight: float = 0.0
+    ev_search_center_ratio: float = 0.5
+    ev_search_edit_weight: float = 0.15
+    ev_search_density_gate_temp: float = 0.25
+    ev_search_hold_ratio: float = 0.25
+    ev_global_overlap_weight: float = 1.0
+    ev_risk_threshold: float = 3.0
+    ev_switch_margin: float = 0.5
+    ev_repair_top_k: int = 2
+    ev_local_density_weight: float = 0.0
+    ev_local_focus_ratio: float = 0.5
+    ev_local_cost_guard: float = 0.0
+    ev_local_rank_weight: float = 0.0
+    ev_global_density_weight: float = 0.0
+    ev_global_density_n_mc: int = 1
+    ev_global_density_inter_rate: int = 1
+    ev_global_density_t_mid: float = 0.2
+    ev_global_density_candidate_topk: int = 8
+    ev_global_density_proxy_type: str = "window_mean"
+    ev_global_density_proxy_overlap_weight: float = 0.0
+    ev_global_density_window_beta: float = 1.0
+    disable_replan: bool = False
+
+def apply_eval_method_alias(args):
+    if getattr(args, "ev_meta_method", "baseline") != "baseline":
+        return
+    method = getattr(args, "eval_method", "compdiffuser")
+    if method == "rcd":
+        args.ev_meta_method = "rcd"
+    elif method == "cdgs":
+        args.ev_meta_method = "cdgs"
+
+def apply_rcd_defaults(args):
+    if getattr(args, "ev_meta_method", None) != "rcd":
+        return
+    # RCD uses the overlap-aware coupled proxy by default.
+    if float(getattr(args, "ev_global_density_proxy_overlap_weight", 0.0)) == 0.0:
+        args.ev_global_density_proxy_overlap_weight = 0.5
 
 def main(args_train, args):
     
@@ -62,8 +115,14 @@ if __name__ == '__main__':
     ## training args
     args_train = Parser().parse_args('diffusion')
     args = Parser().parse_args('plan')
+    apply_eval_method_alias(args)
+    apply_rcd_defaults(args)
     ## 1. get epoch to eval on, by default all
     loadpath = args.logbase, args.dataset, args_train.exp_name
+
+    if getattr(args, "save_logbase", None):
+        rel_savepath = osp.relpath(args.savepath, start=args.logbase)
+        args.savepath = osp.join(args.save_logbase, rel_savepath)
 
     args.pl_seeds = utils.parse_seeds_str(args.pl_seeds) ## a list of int
     args.n_batch_acc_probs = 4 ##
@@ -77,7 +136,7 @@ if __name__ == '__main__':
     ## Default
     args.is_replan = None ## placeholder, should be replaced in the if code blcok below
     args.n_act_per_waypnt = 2
-    args.is_save_pkl = False
+    args.is_save_pkl = bool(getattr(args, "is_save_pkl", False))
     args.is_rd_agv = False
 
     ## the state dimension used in the diffusion models
@@ -100,7 +159,7 @@ if __name__ == '__main__':
                 # args.ev_cp_infer_t_type = 'gsc' ## baselines
                 
                 args.ev_cp_infer_t_type = 'interleave' ## ours
-                args.rd_resol = 300 ## website default: 1000
+                args.rd_resol = int(os.environ.get("RD_RESOL", 300)) ## website default: 1000
                 # args.is_save_pkl = True ## save the plan/rollout trajs to a pkl file
 
                 args.ev_n_comp = 9
@@ -424,7 +483,10 @@ if __name__ == '__main__':
             args.ev_cp_infer_t_type = 'interleave'
             args.rd_resol = 1000
             args.is_save_pkl = True
-            args.ep_st_idx = 80
+            # Evaluate humanoid giant from the first official problem. The old
+            # ep_st_idx=80 setting was a leftover subset-style residue and can
+            # truncate/invalidly shift the full benchmark sweep.
+            args.ep_st_idx = 0
 
             repl_wp_cfg = {}
             args.is_replan = 'ada_dist'
@@ -513,7 +575,9 @@ if __name__ == '__main__':
 
                 args.ev_cp_infer_t_type = 'interleave'
                 args.is_use_subgoal_marker = False
-                args.ep_st_idx = 60
+                # Original release used ep_st_idx=60 for teaser-visualization subset.
+                # For evaluation we start from the first problem.
+                args.ep_st_idx = 0
                 ## teaser animation vis
                 # args.rd_resol = 1200
                 # args.is_rd_agv = True ## render agent view video
@@ -541,8 +605,10 @@ if __name__ == '__main__':
 
                 args.ev_cp_infer_t_type = 'interleave'
                 # args.is_use_subgoal_marker = False
-                
-                args.ep_st_idx = 60
+
+                # Original release used ep_st_idx=60 for teaser-visualization subset.
+                # For evaluation we start from the first problem.
+                args.ep_st_idx = 0
                 ## teaser animation vis
                 # args.rd_resol = 1200
                 # args.is_rd_agv = True ## render agent view video
@@ -569,7 +635,7 @@ if __name__ == '__main__':
                 
                 repl_wp_cfg = {}
                 args.ev_n_comp = 6
-                args.ep_st_idx = 0 ## 20
+                args.ep_st_idx = 0
                 args.is_replan = 'ada_dist'
                 args.ev_cp_infer_t_type = 'interleave'
                 args.rd_resol = 600
@@ -600,8 +666,9 @@ if __name__ == '__main__':
                 args.rd_resol = 1000 # 600 # 1000
                 args.is_save_pkl = True
                 args.is_use_subgoal_marker = False
-                ## for website
-                args.ep_st_idx = 20
+                # Original release used ep_st_idx=20 for website visualization subset.
+                # For evaluation we start from the first problem.
+                args.ep_st_idx = 0
                 args.is_rd_agv = True
 
 
@@ -723,6 +790,15 @@ if __name__ == '__main__':
     args.use_ddim = True
     args.ddim_eta = 1.0
     args.ddim_steps = 50
+
+    # Ablation hook: keep the dataset-specific rollout setup identical, but
+    # force the adaptive replanning budget to zero when requested.
+    if args.disable_replan:
+        if args.is_replan == 'ada_dist':
+            args.repl_ada_dist_cfg = copy.deepcopy(args.repl_ada_dist_cfg)
+            args.repl_ada_dist_cfg['max_n_repl'] = 0
+        elif args.is_replan:
+            args.is_replan = False
     
     args.repl_wp_cfg = repl_wp_cfg
 
@@ -753,6 +829,8 @@ if __name__ == '__main__':
         sub_dir += f'-st{args.ep_st_idx}'
     if args.is_rd_agv:
         sub_dir += '-agv'
+    if args.disable_replan:
+        sub_dir += '-noreplan'
 
     args.savepath = osp.join(args.savepath, sub_dir)
 
@@ -764,4 +842,3 @@ if __name__ == '__main__':
         
         result_list.append(tmp)
     
-

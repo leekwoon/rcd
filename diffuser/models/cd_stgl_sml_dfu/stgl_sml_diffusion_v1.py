@@ -83,6 +83,19 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         self.is_direct_train = self.diff_config.get('is_direct_train', False)
         if self.is_direct_train:
             self.setup_sep16()
+        self.global_density_guide_cfg = dict(
+            enabled=False,
+            weight=0.0,
+            p_ratio=0.35,
+            n_mc_samples=1,
+            inter_rate=1,
+            t_mid=0.2,
+            use_normed_grad=True,
+            exp_beta=2.0,
+            proxy_type='window_mean',
+            overlap_weight=0.0,
+            window_beta=1.0,
+        )
     
     def setup_sep16(self):
         self.infer_deno_type = self.diff_config['infer_deno_type']
@@ -295,6 +308,68 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         else:
             ## normal diffusion
             return x_t_minus_1
+
+    @torch.no_grad()
+    def undo_step_multiple(self, x_p, curr_timestep, prev_timestep):
+        """
+        Push a denoised sample back to a noisier timestep range.
+        Used by the CDGS branch to do repeated local search at the same macro step.
+        """
+        all_betas = self.betas[curr_timestep + 1 : prev_timestep + 1]
+        for beta in all_betas:
+            noise = torch.randn_like(x_p)
+            x_p = (1 - beta) ** 0.5 * x_p + beta ** 0.5 * noise
+        return x_p
+
+    @torch.no_grad()
+    def compute_inversion_score_multiple(self, x_p, tj_cond, timesteps):
+        """
+        Score a candidate by the temporal roughness of its DDIM inversion noise path.
+        Lower score indicates a more self-consistent trajectory chunk.
+        """
+        all_timesteps = torch.arange(
+            1,
+            int(self.ddim_num_inference_steps * 0.2),
+            device=x_p.device,
+        )
+        all_model_predictions = []
+
+        for t in all_timesteps:
+            t_2d = torch.full(
+                (x_p.shape[0], self.horizon),
+                t,
+                device=x_p.device,
+                dtype=torch.long,
+            )
+
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_next = (
+                self.alphas_cumprod[t + 1]
+                if t + 1 < self.ddim_num_inference_steps
+                else self.final_alpha_cumprod
+            )
+            sqrt_alpha_t = torch.sqrt(alpha_t)
+            sqrt_alpha_t_next = torch.sqrt(alpha_t_next)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+            sqrt_one_minus_alpha_t_next = torch.sqrt(1 - alpha_t_next)
+
+            _, _, _, _, pred_epsilon = self.p_mean_variance(
+                x=x_p, t_2d=t_2d, tj_cond=tj_cond, return_modelout=True
+            )
+
+            x0_pred = (x_p - sqrt_one_minus_alpha_t * pred_epsilon) / sqrt_alpha_t
+            x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+            pred_epsilon = (x_p - sqrt_alpha_t * x0_pred) / sqrt_one_minus_alpha_t
+            x_p = sqrt_alpha_t_next * x0_pred + sqrt_one_minus_alpha_t_next * pred_epsilon
+
+            all_model_predictions.append(pred_epsilon)
+
+        all_intermediate_noise_preds = torch.stack(all_model_predictions, dim=1)
+        derivative = torch.diff(all_intermediate_noise_preds, dim=1)
+        all_scores = torch.norm(
+            derivative.reshape(x_p.shape[0], -1), dim=1
+        ).reshape(x_p.shape[0])
+        return all_scores
 
     
     def get_tj_cond(self, x, g_cond, timesteps):
@@ -996,6 +1071,507 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
             assert RuntimeError()
 
         return ModelPrediction(pred_noise, x_start, out_pred)
+
+    def build_empty_eval_tj_cond(self, batch_size, device, do_cond=False):
+        zeros_b = torch.zeros(size=(batch_size,), dtype=torch.bool, device=device)
+        return dict(
+            st_ovlp_is_drop=None,
+            end_ovlp_is_drop=None,
+            st_ovlp_traj=None,
+            end_ovlp_traj=None,
+            st_ovlp_t=None,
+            end_ovlp_t=None,
+            is_st_inpat=zeros_b,
+            is_end_inpat=zeros_b,
+            do_cond=do_cond,
+        )
+
+    def update_global_density_guide_config(self, cfg: dict):
+        if cfg is None:
+            return
+        self.global_density_guide_cfg.update(cfg)
+
+    def infer_num_comp_from_total_hzn(self, total_hzn: int) -> int:
+        if total_hzn <= self.horizon:
+            return 1
+        step = self.horizon - self.len_ovlp_cd
+        return max(1, int(round((total_hzn - self.horizon) / step)) + 1)
+
+    def build_global_window_starts(self, total_hzn: int, n_comp: int = None):
+        if total_hzn <= self.horizon:
+            return [0]
+        if n_comp is None:
+            n_comp = self.infer_num_comp_from_total_hzn(total_hzn)
+        max_start = total_hzn - self.horizon
+        seam_step = self.horizon - self.len_ovlp_cd
+        starts = {0, max_start}
+        half_h = self.horizon // 2
+        for i_c in range(1, n_comp):
+            seam_idx = i_c * seam_step
+            start = int(np.clip(seam_idx - half_h, 0, max_start))
+            starts.add(start)
+        return sorted(int(v) for v in starts)
+
+    def compose_chunk_seq_exp_torch(self, chunk_seq: torch.Tensor, beta: float = 2.0):
+        assert chunk_seq.ndim == 4
+        n_comp, batch_size, _, dim = chunk_seq.shape
+        total_hzn = self.get_total_hzn(n_comp)
+        step = self.horizon - self.len_ovlp_cd
+        traj_out = torch.zeros(
+            (batch_size, total_hzn, dim),
+            device=chunk_seq.device,
+            dtype=chunk_seq.dtype,
+        )
+
+        for i_c in range(n_comp):
+            chunk = chunk_seq[i_c]
+            if i_c == 0:
+                st_idx = 0
+                ed_idx = step
+                traj_out[:, st_idx:ed_idx, :] = chunk[:, :step, :]
+            elif i_c < n_comp - 1:
+                st_idx = self.horizon + (i_c - 1) * step
+                ed_idx = st_idx + (self.horizon - 2 * self.len_ovlp_cd)
+                traj_out[:, st_idx:ed_idx, :] = chunk[
+                    :, self.len_ovlp_cd : self.horizon - self.len_ovlp_cd, :
+                ]
+            else:
+                st_idx = self.horizon + (i_c - 1) * step
+                ed_idx = st_idx + step
+                traj_out[:, st_idx:ed_idx, :] = chunk[:, self.len_ovlp_cd :, :]
+
+        if self.len_ovlp_cd <= 1:
+            weights = torch.ones(
+                (1, self.len_ovlp_cd, 1),
+                device=chunk_seq.device,
+                dtype=chunk_seq.dtype,
+            )
+        else:
+            t_vals = torch.arange(
+                self.len_ovlp_cd,
+                device=chunk_seq.device,
+                dtype=chunk_seq.dtype,
+            )
+            denom = float(self.len_ovlp_cd - 1)
+            exp_neg_beta = float(np.exp(-beta))
+            weights = (
+                torch.exp(-beta * t_vals / denom) - exp_neg_beta
+            ) / max(1e-6, 1.0 - exp_neg_beta)
+            weights = weights.view(1, self.len_ovlp_cd, 1)
+
+        for i_c in range(n_comp - 1):
+            st_idx = (i_c + 1) * step
+            ed_idx = st_idx + self.len_ovlp_cd
+            end_ov = chunk_seq[i_c, :, -self.len_ovlp_cd :, :]
+            st_ov = chunk_seq[i_c + 1, :, : self.len_ovlp_cd, :]
+            traj_out[:, st_idx:ed_idx, :] = weights * end_ov + (1.0 - weights) * st_ov
+
+        return traj_out
+
+    def compose_window_seq_torch(
+        self,
+        window_seq: torch.Tensor,
+        window_starts,
+        total_hzn: int,
+        beta: float = 1.0,
+    ):
+        assert window_seq.ndim == 4
+        n_windows, batch_size, _, dim = window_seq.shape
+        assert n_windows == len(window_starts)
+
+        traj_out = torch.zeros(
+            (batch_size, total_hzn, dim),
+            device=window_seq.device,
+            dtype=window_seq.dtype,
+        )
+        weight_sum = torch.zeros(
+            (batch_size, total_hzn, 1),
+            device=window_seq.device,
+            dtype=window_seq.dtype,
+        )
+
+        pos = torch.arange(
+            self.horizon,
+            device=window_seq.device,
+            dtype=window_seq.dtype,
+        )
+        local_w = torch.minimum(pos + 1.0, float(self.horizon) - pos)
+        local_w = local_w / torch.clamp(local_w.max(), min=1.0)
+        local_w = torch.clamp(local_w, min=1e-3).pow(float(beta))
+        local_w = local_w.view(1, self.horizon, 1)
+
+        for idx_w, st_idx in enumerate(window_starts):
+            ed_idx = st_idx + self.horizon
+            traj_out[:, st_idx:ed_idx, :] += local_w * window_seq[idx_w]
+            weight_sum[:, st_idx:ed_idx, :] += local_w
+
+        return traj_out / torch.clamp(weight_sum, min=1e-6)
+
+    def compute_window_overlap_loss(
+        self,
+        window_seq: torch.Tensor,
+        window_starts,
+    ):
+        assert window_seq.ndim == 4
+        n_windows, batch_size, _, _ = window_seq.shape
+        loss = torch.zeros(
+            (batch_size,),
+            device=window_seq.device,
+            dtype=window_seq.dtype,
+        )
+        n_pairs = 0
+
+        for idx_a in range(n_windows):
+            st_a = int(window_starts[idx_a])
+            ed_a = st_a + self.horizon
+            for idx_b in range(idx_a + 1, n_windows):
+                st_b = int(window_starts[idx_b])
+                ed_b = st_b + self.horizon
+                ov_st = max(st_a, st_b)
+                ov_ed = min(ed_a, ed_b)
+                if ov_ed <= ov_st:
+                    continue
+                sl_a = slice(ov_st - st_a, ov_ed - st_a)
+                sl_b = slice(ov_st - st_b, ov_ed - st_b)
+                diff = window_seq[idx_a, :, sl_a, :] - window_seq[idx_b, :, sl_b, :]
+                loss = loss + torch.mean(diff.pow(2), dim=(1, 2))
+                n_pairs += 1
+
+        if n_pairs > 0:
+            loss = loss / float(n_pairs)
+        return loss
+
+    def coupled_global_density_proxy_loss(
+        self,
+        full_trajs: torch.Tensor,
+        p_ratio: float = 0.35,
+        n_mc_samples: int = 1,
+        window_starts=None,
+        overlap_weight: float = 0.0,
+        window_beta: float = 1.0,
+    ):
+        assert full_trajs.ndim == 3
+        batch_size, total_hzn, _ = full_trajs.shape
+        if window_starts is None:
+            window_starts = self.build_global_window_starts(total_hzn)
+        n_windows = len(window_starts)
+
+        probe_t = int(round((self.n_timesteps - 1) * p_ratio))
+        probe_t = max(1, min(self.n_timesteps - 1, probe_t))
+        full_t_2d = torch.full(
+            (batch_size, total_hzn),
+            probe_t,
+            device=full_trajs.device,
+            dtype=torch.long,
+        )
+        win_t_2d = torch.full(
+            (batch_size * n_windows, self.horizon),
+            probe_t,
+            device=full_trajs.device,
+            dtype=torch.long,
+        )
+        tj_cond = self.build_empty_eval_tj_cond(
+            batch_size=batch_size * n_windows,
+            device=full_trajs.device,
+            do_cond=False,
+        )
+
+        recon_list = []
+        overlap_list = []
+        for _ in range(max(1, n_mc_samples)):
+            noisy_full = self.q_sample(
+                x_start=full_trajs,
+                t_2d=full_t_2d,
+                noise=None,
+                mask_no_noise=None,
+            )
+            noisy_windows = torch.cat(
+                [
+                    noisy_full[:, st_idx : st_idx + self.horizon, :]
+                    for st_idx in window_starts
+                ],
+                dim=0,
+            )
+            x0_hat = self.model_predictions(
+                x=noisy_windows,
+                t_2d=win_t_2d,
+                tj_cond=tj_cond,
+            ).pred_x_start
+            x0_hat_seq = einops.rearrange(
+                x0_hat,
+                '(n_w b) h d -> n_w b h d',
+                n_w=n_windows,
+                b=batch_size,
+            )
+            full_recon = self.compose_window_seq_torch(
+                x0_hat_seq,
+                window_starts=window_starts,
+                total_hzn=total_hzn,
+                beta=window_beta,
+            )
+            recon_list.append(full_recon)
+            if overlap_weight > 0.0:
+                overlap_list.append(
+                    self.compute_window_overlap_loss(x0_hat_seq, window_starts)
+                )
+
+        recon_stack = torch.stack(recon_list, dim=0)
+        recon_err = torch.mean(
+            (recon_stack - full_trajs.unsqueeze(0)) ** 2,
+            dim=(0, 2, 3),
+        )
+        if overlap_list:
+            overlap_term = torch.stack(overlap_list, dim=0).mean(dim=0)
+        else:
+            overlap_term = torch.zeros_like(recon_err)
+
+        losses = recon_err
+        losses = losses + float(overlap_weight) * overlap_term
+        return losses, window_starts
+
+    def density_proxy_loss(
+        self,
+        x_start: torch.Tensor,
+        p_ratio: float = 0.35,
+        n_mc_samples: int = 1,
+        tj_cond: dict = None,
+        focus_mask: torch.Tensor = None,
+        detach_target: bool = True,
+    ):
+        assert x_start.ndim == 3
+        batch_size = x_start.shape[0]
+        probe_t = int(round((self.n_timesteps - 1) * p_ratio))
+        probe_t = max(1, min(self.n_timesteps - 1, probe_t))
+        t_2d = torch.full(
+            (batch_size, self.horizon),
+            probe_t,
+            device=x_start.device,
+            dtype=torch.long,
+        )
+
+        if tj_cond is None:
+            tj_cond = self.build_empty_eval_tj_cond(
+                batch_size=batch_size,
+                device=x_start.device,
+                do_cond=False,
+            )
+
+        if focus_mask is not None:
+            if focus_mask.ndim == 1:
+                focus_mask = focus_mask[None, :]
+            if focus_mask.ndim == 3:
+                focus_mask = focus_mask[..., 0]
+            assert focus_mask.shape == (batch_size, self.horizon)
+            focus_mask = focus_mask.to(device=x_start.device, dtype=x_start.dtype)
+
+        errs = []
+        for _ in range(max(1, n_mc_samples)):
+            x_t = self.q_sample(x_start=x_start, t_2d=t_2d, noise=None, mask_no_noise=None)
+            x0_hat = self.model_predictions(x=x_t, t_2d=t_2d, tj_cond=tj_cond).pred_x_start
+            if detach_target:
+                x0_hat = x0_hat.detach()
+            sq_err = torch.mean((x0_hat - x_start) ** 2, dim=2)
+            if focus_mask is None:
+                errs.append(torch.mean(sq_err, dim=1))
+            else:
+                denom = torch.clamp(focus_mask.sum(dim=1), min=1.0)
+                errs.append(torch.sum(sq_err * focus_mask, dim=1) / denom)
+
+        return torch.stack(errs, dim=0).mean(dim=0)
+
+    def global_density_proxy_loss(
+        self,
+        full_trajs: torch.Tensor,
+        p_ratio: float = 0.35,
+        n_mc_samples: int = 1,
+        window_starts = None,
+        proxy_type: str = 'window_mean',
+        overlap_weight: float = 0.0,
+        window_beta: float = 1.0,
+    ):
+        assert full_trajs.ndim == 3
+        batch_size, total_hzn, _ = full_trajs.shape
+        if window_starts is None:
+            window_starts = self.build_global_window_starts(total_hzn)
+        if proxy_type == 'coupled_recon':
+            return self.coupled_global_density_proxy_loss(
+                full_trajs,
+                p_ratio=p_ratio,
+                n_mc_samples=n_mc_samples,
+                window_starts=window_starts,
+                overlap_weight=overlap_weight,
+                window_beta=window_beta,
+            )
+        windows = torch.cat(
+            [full_trajs[:, st_idx : st_idx + self.horizon, :] for st_idx in window_starts],
+            dim=0,
+        )
+        losses = self.density_proxy_loss(
+            windows,
+            p_ratio=p_ratio,
+            n_mc_samples=n_mc_samples,
+            tj_cond=None,
+            focus_mask=None,
+            detach_target=True,
+        )
+        losses = losses.view(len(window_starts), batch_size).mean(dim=0)
+        return losses, window_starts
+
+    @torch.no_grad()
+    def estimate_global_density_proxy(
+        self,
+        full_trajs: torch.Tensor,
+        p_ratio: float = 0.35,
+        n_mc_samples: int = 1,
+        window_starts = None,
+        proxy_type: str = 'window_mean',
+        overlap_weight: float = 0.0,
+        window_beta: float = 1.0,
+    ):
+        losses, window_starts = self.global_density_proxy_loss(
+            full_trajs,
+            p_ratio=p_ratio,
+            n_mc_samples=n_mc_samples,
+            window_starts=window_starts,
+            proxy_type=proxy_type,
+            overlap_weight=overlap_weight,
+            window_beta=window_beta,
+        )
+        return losses, window_starts
+
+    def should_apply_global_density_guidance(self, cur_timestep: int):
+        cfg = self.global_density_guide_cfg
+        if not cfg.get('enabled', False):
+            return False
+        if cfg.get('weight', 0.0) <= 0.0:
+            return False
+        if cur_timestep <= int(self.n_timesteps * cfg.get('t_mid', 0.2)):
+            return False
+        inter_rate = max(1, int(cfg.get('inter_rate', 1)))
+        # Convert the diffusion timestep to an inference-step index so that
+        # `inter_rate` skips genuinely scale with the value of `inter_rate`.
+        # Without this conversion, when the DDIM step ratio is a multiple of
+        # `inter_rate`, `cur_timestep % inter_rate` is trivially 0 for every
+        # visited timestep and intermittent guidance becomes a no-op.
+        if getattr(self, 'use_ddim', False):
+            step_ratio = max(
+                1,
+                int(self.num_train_timesteps) // max(1, int(self.ddim_num_inference_steps)),
+            )
+            step_idx = int(cur_timestep) // step_ratio
+        else:
+            step_idx = int(cur_timestep)
+        return (step_idx % inter_rate) == 0
+
+    def get_guidance_variance(self, timesteps, x_shape):
+        if self.use_ddim:
+            prev_timestep = timesteps - self.num_train_timesteps // self.ddim_num_inference_steps
+            alpha_prod_t = extract_2d(self.alphas_cumprod, timesteps, x_shape)
+            if prev_timestep[0, 0] >= 0:
+                alpha_prod_t_prev = extract_2d(self.alphas_cumprod, prev_timestep, x_shape)
+            else:
+                alpha_prod_t_prev = extract_2d(
+                    self.final_alpha_cumprod.to(timesteps.device),
+                    torch.zeros_like(timesteps),
+                    x_shape,
+                )
+            variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t)
+            variance = variance * (1 - alpha_prod_t / alpha_prod_t_prev)
+            return torch.clamp(variance, min=0.0)
+        return extract_2d(self.posterior_variance, timesteps, x_shape)
+
+    def apply_global_density_guidance(
+        self,
+        x_prev: torch.Tensor,
+        x_cur: torch.Tensor,
+        tj_cond: dict,
+        timesteps: torch.Tensor,
+        n_comp: int,
+    ):
+        cfg = self.global_density_guide_cfg
+        with torch.enable_grad():
+            x_in = x_cur.detach().requires_grad_(True)
+            x0 = self.model_predictions(x=x_in, t_2d=timesteps, tj_cond=tj_cond).pred_x_start
+            x0_seq = einops.rearrange(
+                x0,
+                '(n_comp b) h d -> n_comp b h d',
+                n_comp=n_comp,
+            )
+            stitched_x0 = self.compose_chunk_seq_exp_torch(
+                x0_seq,
+                beta=float(cfg.get('exp_beta', 2.0)),
+            )
+            global_loss, window_starts = self.global_density_proxy_loss(
+                stitched_x0,
+                p_ratio=float(cfg.get('p_ratio', 0.35)),
+                n_mc_samples=int(cfg.get('n_mc_samples', 1)),
+                proxy_type=str(cfg.get('proxy_type', 'window_mean')),
+                overlap_weight=float(cfg.get('overlap_weight', 0.0)),
+                window_beta=float(cfg.get('window_beta', 1.0)),
+            )
+            grad = torch.autograd.grad(global_loss.mean(), x_in)[0]
+
+        if cfg.get('use_normed_grad', True):
+            grad_norm = grad.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+            grad = grad / grad_norm
+
+        variance = self.get_guidance_variance(timesteps, x_cur.shape)
+        x_prev = x_prev - float(cfg.get('weight', 0.0)) * variance * grad
+        stats = dict(
+            global_density=float(global_loss.mean().detach().cpu().item()),
+            window_starts=[int(v) for v in window_starts],
+            proxy_type=str(cfg.get('proxy_type', 'window_mean')),
+        )
+        return x_prev, stats
+
+    @torch.no_grad()
+    def estimate_density_proxy(
+        self,
+        x_start: torch.Tensor,
+        p_ratio: float = 0.35,
+        n_mc_samples: int = 2,
+        tj_cond: dict = None,
+        focus_mask: torch.Tensor = None,
+    ):
+        """
+        SG-minority style density proxy:
+        perturb x0 to a fixed intermediate noise level and measure self-reconstruction error.
+        Lower error indicates a denser / more self-consistent sample.
+        """
+        assert x_start.ndim == 3
+        batch_size = x_start.shape[0]
+        probe_t = int(round((self.n_timesteps - 1) * p_ratio))
+        probe_t = max(1, min(self.n_timesteps - 1, probe_t))
+        t_2d = torch.full(
+            (batch_size, self.horizon),
+            probe_t,
+            device=x_start.device,
+            dtype=torch.long,
+        )
+
+        if tj_cond is None:
+            tj_cond = self.build_empty_eval_tj_cond(
+                batch_size=batch_size,
+                device=x_start.device,
+                do_cond=False,
+            )
+
+        if focus_mask is not None:
+            if focus_mask.ndim == 1:
+                focus_mask = focus_mask[None, :]
+            if focus_mask.ndim == 3:
+                focus_mask = focus_mask[..., 0]
+            assert focus_mask.shape == (batch_size, self.horizon)
+            focus_mask = focus_mask.to(device=x_start.device, dtype=x_start.dtype)
+
+        return self.density_proxy_loss(
+            x_start,
+            p_ratio=p_ratio,
+            n_mc_samples=n_mc_samples,
+            tj_cond=tj_cond,
+            focus_mask=focus_mask,
+            detach_target=False,
+        )
     
 
 
@@ -1642,8 +2218,9 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
             ## NEW:
             ## concat all x_p into one batch and sample only one times
             x_p_list_cur_t = torch.cat(x_p_list_cur_t, dim=0)
+            x_p_list_input_t = x_p_list_cur_t
 
-            assert len(tj_cond_mg['st_ovlp_is_drop']) == len(x_p_list_cur_t)
+            assert len(tj_cond_mg['st_ovlp_is_drop']) == len(x_p_list_input_t)
 
             ## (n_comp*B,hzn)
             t_steps_mg = torch.cat([timesteps,]*n_comp, dim=0)
@@ -1651,12 +2228,31 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
             # pdb.set_trace()
 
             if do_mcmc:
-                x_p_list_cur_t = self.resample_same_t_mcmc( x_p_list_cur_t, tj_cond_mg, t_steps_mg )
+                x_p_list_input_t = self.resample_same_t_mcmc(
+                    x_p_list_input_t,
+                    tj_cond_mg,
+                    t_steps_mg,
+                )
 
             if self.use_ddim:
-                x_p_list_cur_t = self.ddim_p_sample(x_p_list_cur_t, tj_cond_mg, t_steps_mg, self.ddim_eta, use_clipped_model_output=True)
+                x_p_list_cur_t = self.ddim_p_sample(
+                    x_p_list_input_t,
+                    tj_cond_mg,
+                    t_steps_mg,
+                    self.ddim_eta,
+                    use_clipped_model_output=True,
+                )
             else:
-                x_p_list_cur_t = self.p_sample(x_p_list_cur_t, tj_cond_mg, t_steps_mg)
+                x_p_list_cur_t = self.p_sample(x_p_list_input_t, tj_cond_mg, t_steps_mg)
+
+            if self.should_apply_global_density_guidance(int(i_t)):
+                x_p_list_cur_t, _ = self.apply_global_density_guidance(
+                    x_prev=x_p_list_cur_t,
+                    x_cur=x_p_list_input_t,
+                    tj_cond=tj_cond_mg,
+                    timesteps=t_steps_mg,
+                    n_comp=n_comp,
+                )
             
             # # x_p_list[i_tj] = x_p_i
             # x_p_list_next_t[i_tj] = x_p_i
@@ -1704,6 +2300,188 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
 
 
     
+    @torch.no_grad()
+    def comp_pred_p_loop_n_CDGS(
+        self,
+        shape,
+        stgl_cond,
+        n_comp,
+        do_mcmc=False,
+        verbose=True,
+        return_diffusion=False,
+    ):
+        """
+        CDGS-style guided search:
+        repeatedly denoise around the same macro timestep, then prune candidates
+        using an inversion self-consistency score in late diffusion steps.
+        """
+        assert (
+            n_comp >= 2 and not do_mcmc
+        ), "mcmc might be bad in our case and not implemented for DDIM yet."
+        device = self.betas.device
+
+        batch_size = shape[0]
+        hzn = shape[1]
+
+        x_p_list = [torch.randn(shape, device=device) for _ in range(n_comp)]
+        x_dfu_all = [x_p_list]
+
+        assert len(stgl_cond[0]) == shape[0], f"{len(stgl_cond[0])} vs {shape[0]}"
+
+        if self.use_ddim:
+            time_idx = self.ddim_set_timesteps(self.ddim_num_inference_steps)
+        else:
+            time_idx = reversed(range(0, self.n_timesteps))
+
+        from tqdm import tqdm
+
+        for id, i_t in enumerate(tqdm(time_idx)):
+            timesteps = torch.full(
+                (batch_size, self.horizon),
+                i_t,
+                device=device,
+                dtype=torch.long,
+            )
+
+            inversion_scores = [None for _ in range(n_comp)]
+            n_repeat = 10
+
+            for u_t in tqdm(range(n_repeat)):
+                x_p_list_next_t = [None for _ in range(n_comp)]
+                x_p_list = self.avg_ovlp_chunk_GSC(x_p_list)
+
+                for i_tj in range(n_comp):
+                    x_p_i = x_p_list[i_tj]
+
+                    if i_tj == 0:
+                        x_p_i_plus_1 = x_p_list[i_tj + 1]
+                        st_traj_2, _ = self.extract_ovlp_from_full(x_p_i_plus_1)
+
+                        x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
+                            x_et=x_p_i,
+                            st_traj=None,
+                            end_traj=st_traj_2,
+                            t_1d_st=timesteps[:, 0],
+                            t_1d_end=timesteps[:, 0],
+                            t_type='0',
+                            is_noisy=True,
+                            stgl_cond={0: stgl_cond[0]},
+                        )
+                        tj_cond_p_i['end_ovlp_is_drop'] = None
+                        tj_cond_p_i['do_cond'] = False
+                        if do_mcmc:
+                            x_p_i = self.resample_same_t_mcmc(
+                                x_p_i, tj_cond_p_i, timesteps
+                            )
+                        if self.use_ddim:
+                            x_p_i = self.ddim_p_sample(
+                                x_p_i,
+                                tj_cond_p_i,
+                                timesteps,
+                                self.ddim_eta,
+                                use_clipped_model_output=True,
+                            )
+                        else:
+                            x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+
+                    elif i_tj > 0 and i_tj < n_comp - 1:
+                        tj_cond_p_i = dict(
+                            st_ovlp_is_drop=None,
+                            end_ovlp_is_drop=None,
+                            is_st_inpat=torch.zeros_like(x_p_i[:, 0, 0]).to(torch.bool),
+                            is_end_inpat=torch.zeros_like(x_p_i[:, 0, 0]).to(torch.bool),
+                        )
+                        tj_cond_p_i['do_cond'] = False
+
+                        if do_mcmc:
+                            x_p_i = self.resample_same_t_mcmc(
+                                x_p_i, tj_cond_p_i, timesteps
+                            )
+                        if self.use_ddim:
+                            x_p_i = self.ddim_p_sample(
+                                x_p_i,
+                                tj_cond_p_i,
+                                timesteps,
+                                self.ddim_eta,
+                                use_clipped_model_output=True,
+                            )
+                        else:
+                            x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+
+                    else:
+                        x_p_i_minus_1 = x_p_list[i_tj - 1]
+                        _, end_traj_i_minus_1 = self.extract_ovlp_from_full(
+                            x_p_i_minus_1
+                        )
+
+                        x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
+                            x_et=x_p_i,
+                            st_traj=end_traj_i_minus_1,
+                            end_traj=None,
+                            t_1d_st=timesteps[:, 0],
+                            t_1d_end=timesteps[:, 0],
+                            t_type='0',
+                            is_noisy=True,
+                            stgl_cond={hzn - 1: stgl_cond[hzn - 1]},
+                        )
+                        tj_cond_p_i['st_ovlp_is_drop'] = None
+                        tj_cond_p_i['do_cond'] = False
+
+                        if do_mcmc:
+                            x_p_i = self.resample_same_t_mcmc(
+                                x_p_i, tj_cond_p_i, timesteps
+                            )
+                        if self.use_ddim:
+                            x_p_i = self.ddim_p_sample(
+                                x_p_i,
+                                tj_cond_p_i,
+                                timesteps,
+                                self.ddim_eta,
+                                use_clipped_model_output=True,
+                            )
+                        else:
+                            x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+
+                    if id < len(time_idx) - 1 and u_t < n_repeat - 1:
+                        curr_timestep = time_idx[id]
+                        prev_timestep = time_idx[id + 1]
+                        x_p_i = self.undo_step_multiple(
+                            x_p_i, prev_timestep, curr_timestep
+                        )
+
+                    x_p_list_next_t[i_tj] = x_p_i
+
+                    if u_t == n_repeat - 1 and id > 0.94 * len(time_idx):
+                        inversion_scores[i_tj] = self.compute_inversion_score_multiple(
+                            x_p_i, tj_cond_p_i, timesteps
+                        )
+
+                x_p_list = x_p_list_next_t
+
+            if id > 0.94 * len(time_idx):
+                cumulative_score = [inversion_scores[i_tj] for i_tj in range(n_comp)]
+                avg_score = torch.stack(cumulative_score, dim=1).mean(dim=1)
+                topk = max(1, int(0.1 * avg_score.shape[0]))
+                _, selected_indices = torch.topk(-avg_score, topk)
+
+                for i_tj in range(n_comp):
+                    x_p = x_p_list[i_tj][selected_indices]
+                    while x_p.shape[0] < shape[0]:
+                        x_p = torch.cat([x_p, x_p], dim=0)
+                    x_p_list[i_tj] = x_p[: shape[0]]
+
+            if return_diffusion:
+                x_dfu_all.append([_ for _ in x_p_list])
+
+        x_p_list[0] = apply_conditioning(x_p_list[0], {0: stgl_cond[0]}, 0)
+        x_p_list[-1] = apply_conditioning(
+            x_p_list[-1], {hzn - 1: stgl_cond[hzn - 1]}, 0
+        )
+
+        if return_diffusion:
+            return x_p_list, x_dfu_all
+        return x_p_list
+
     @torch.no_grad()
     def comp_pred_p_loop_n_GSC(self, ##  
                         shape, stgl_cond, n_comp, do_mcmc=False, verbose=True, return_diffusion=False):
