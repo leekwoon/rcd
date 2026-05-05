@@ -64,6 +64,21 @@ pip install -r conda_env/requirements.txt
 After these steps, you can use conda env `rcd_ogbench` to launch experiments.
 
 
+## 🧪 Toy Experiment
+A self-contained reproduction of the toy bimodal composition example (Figure 1 of the paper) is provided under `toy_example/`. It includes training of the three local diffusion models on length-3 segments, compositional inference at horizons $L \in \{4, \ldots, 20\}$, and figure assembly. See `toy_example/README.md` for instructions.
+
+<table align="center" width="100%">
+  <tr>
+    <td width="50%" align="center"><b>CompDiffuser</b></td>
+    <td width="50%" align="center"><b>RCD</b></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="media/toy_base_L12.gif" width="100%"></td>
+    <td width="50%"><img src="media/toy_rcd_L12_lam5.gif" width="100%"></td>
+  </tr>
+</table>
+
+
 ## 📊 Using Pretrained Models
 
 Since RCD is a training-free method, one can directly reuse the pre-trained CompDiffuser planners and inverse dynamics models released by Luo et al. Please follow the [CompDiffuser release](https://github.com/devinluo27/comp_diffuser_release) for the download links and corresponding config files. After unzipping, the files should be placed under `logs/` with the following structure:
@@ -121,21 +136,6 @@ python diffuser/ogb_task/ogb_maze_v1/plan_ogb_stgl_sml_rcd.py \
 ```
 
 Replace the `--config` path with any other env-specific config under `config/`. The `--eval_method` flag also accepts `compdiffuser` and `cdgs` for the baselines reported in the paper. Rollout videos and per-episode rollout JSON summaries are saved under `logs_rollout_rcd/${env_name}/plans/${experiment_name}/${seed}/${experiment_time}/`.
-
-
-## 🧪 Toy Experiment
-A self-contained reproduction of the toy bimodal composition example (Figure 1 of the paper) is provided under `toy_example/`. It includes training of the three local diffusion models on length-3 segments, compositional inference at horizons $L \in \{4, \ldots, 20\}$, and figure assembly. See `toy_example/README.md` for instructions.
-
-<table align="center" width="100%">
-  <tr>
-    <td width="50%" align="center"><b>CompDiffuser</b></td>
-    <td width="50%" align="center"><b>RCD</b></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="media/toy_base_L12.gif" width="100%"></td>
-    <td width="50%"><img src="media/toy_rcd_L12_lam5.gif" width="100%"></td>
-  </tr>
-</table>
 
 
 ## 🏷️ License
