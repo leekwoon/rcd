@@ -1,8 +1,8 @@
 # Refining Compositional Diffusion for Reliable Long-Horizon Planning
 
 [[Project page]](https://refining-compositional-diffusion.github.io/)
-[[Paper]]()
-[[ArXiv]]()
+[[Paper]](https://arxiv.org/pdf/2605.03075)
+[[ArXiv]](https://arxiv.org/abs/2605.03075)
 <!-- declare variables -->
 
 
