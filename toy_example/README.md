@@ -78,31 +78,3 @@ python make_figure.py --results-dir results
 ```
 
 This produces `standalone_panels/`, one PDF/PNG per panel (training segments, CompDiffuser samples, RCD samples, valid-rate vs.\ horizon).
-
----
-
-## Reproducing the Component Ablation in the Appendix
-
-The appendix also contains a three-panel ablation that isolates the two RCD guidance components (overlap-only, reconstruction-only, both). To reproduce, run inference at horizon `L=10` with three different `(recon_weight, overlap_weight)` combinations and tag the outputs:
-
-```bash
-# Overlap only
-python inference.py --method rcd --horizon 10 --save-dir results_component_ablation \
-    --method-tag overlap_only \
-    --rcd-guidance-scale 5.0 --rcd-probe-ratio 0.35 --rcd-n-mc-samples 4 --rcd-inter-rate 1 \
-    --rcd-recon-weight 0.0 --rcd-overlap-weight 1.0
-
-# Reconstruction only
-python inference.py --method rcd --horizon 10 --save-dir results_component_ablation \
-    --method-tag recon_only \
-    --rcd-guidance-scale 5.0 --rcd-probe-ratio 0.35 --rcd-n-mc-samples 4 --rcd-inter-rate 1 \
-    --rcd-recon-weight 1.0 --rcd-overlap-weight 0.0
-
-# Both (full RCD)
-python inference.py --method rcd --horizon 10 --save-dir results_component_ablation \
-    --method-tag both \
-    --rcd-guidance-scale 5.0 --rcd-probe-ratio 0.35 --rcd-n-mc-samples 4 --rcd-inter-rate 1 \
-    --rcd-recon-weight 1.0 --rcd-overlap-weight 1.0
-```
-
-Each call writes `L10_rcd_{tag}.npy` and `L10_rcd_{tag}.json` into `results_component_ablation/`.
