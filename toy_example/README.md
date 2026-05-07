@@ -47,11 +47,21 @@ For each horizon `H in {4, 5, 6, ..., 20}` and each method `M in {base, rcd}`, r
 python inference.py --method $M --horizon $H --save-dir results
 ```
 
-For RCD, an example invocation is:
+For RCD, the runs that produced our reported toy results use a horizon-dependent guidance scale (`0.5` for `H=4`, `5.0` for `H>=5`); other RCD-specific hyperparameters are kept fixed:
 
 ```bash
+# H >= 5
 python inference.py --method rcd --horizon $H --save-dir results \
     --rcd-guidance-scale 5.0 \
+    --rcd-probe-ratio 0.35 \
+    --rcd-n-mc-samples 4 \
+    --rcd-overlap-weight 1.0 \
+    --rcd-recon-weight 1.0 \
+    --rcd-inter-rate 1
+
+# H = 4 (smaller guidance scale)
+python inference.py --method rcd --horizon 4 --save-dir results \
+    --rcd-guidance-scale 0.5 \
     --rcd-probe-ratio 0.35 \
     --rcd-n-mc-samples 4 \
     --rcd-overlap-weight 1.0 \
