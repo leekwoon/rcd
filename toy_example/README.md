@@ -47,21 +47,11 @@ For each horizon `H in {4, 5, 6, ..., 20}` and each method `M in {base, rcd}`, r
 python inference.py --method $M --horizon $H --save-dir results
 ```
 
-For RCD specifically, we use the same hyperparameters as in the paper (probe ratio 0.35, 4 Monte-Carlo reconstruction samples, intermittent rate 1) and a horizon-dependent guidance scale: `0.5` for `H=4` (the baseline case where mode-averaging is not yet an issue and a gentle guidance suffices) and `5.0` for `H>=5`:
+For RCD, an example invocation is:
 
 ```bash
-# Default (H >= 5)
 python inference.py --method rcd --horizon $H --save-dir results \
     --rcd-guidance-scale 5.0 \
-    --rcd-probe-ratio 0.35 \
-    --rcd-n-mc-samples 4 \
-    --rcd-overlap-weight 1.0 \
-    --rcd-recon-weight 1.0 \
-    --rcd-inter-rate 1
-
-# Special case: H = 4 (use a smaller guidance scale to avoid over-guidance)
-python inference.py --method rcd --horizon 4 --save-dir results \
-    --rcd-guidance-scale 0.5 \
     --rcd-probe-ratio 0.35 \
     --rcd-n-mc-samples 4 \
     --rcd-overlap-weight 1.0 \
